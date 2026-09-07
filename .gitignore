@@ -1,0 +1,19 @@
+# Data files (not included - see README for source)
+*.csv
+data/raw/
+data/processed/
+
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Knitted output
+*.html
+*.nb.html
+
+# OS
+.DS_Store
+Thumbs.db

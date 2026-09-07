@@ -1,0 +1,495 @@
+---
+title: "Gene Expression Analysis: Preprocessing, Clustering, Classification & Model Evaluation"
+author: "Promise"
+date: "2026-08-12"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Step 1: Load libraries
+```{r}
+library(readr)
+```
+
+Step 2: Load and reshape data
+```{r}
+brca <- read.csv("data/brca.csv", header = FALSE, stringsAsFactors = FALSE)
+dim(brca)
+
+sample_ids <- brca[1, -1]
+measure_type <- brca[2, -1]
+gene_names <- brca[-c(1,2), 1]
+
+keep_cols <- which(measure_type == "RPKM") + 1
+
+counts <- brca[-c(1,2), keep_cols]
+counts <- apply(counts, 2, as.numeric)
+rownames(counts) <- gene_names
+colnames(counts) <- as.character(sample_ids[measure_type == "RPKM"])
+
+dim(counts)
+counts[1:5, 1:5]
+
+brca <- counts
+rm(counts)
+dim(brca)
+```
+
+Step 3: Clean the data
+```{r}
+keep <- rowSums(brca > 0) / ncol(brca) >= 0.2
+brca <- brca[keep, ]
+
+brca <- brca[apply(brca, 1, var) > 0, ]
+
+sum(is.na(brca))
+brca[is.na(brca)] <- 0
+
+dim(brca)
+```
+
+Step 4: Descriptive statistics
+```{r}
+gene_mean   <- rowMeans(brca)
+gene_median <- apply(brca, 1, median)
+gene_sd     <- apply(brca, 1, sd)
+
+summary(gene_mean)
+summary(gene_median)
+summary(gene_sd)
+
+sample_totals <- colSums(brca)
+summary(sample_totals)
+```
+
+Step 5: Log2 transform
+```{r}
+log_brca <- log2(brca + 1)
+```
+
+Step 6: Visualize
+```{r}
+boxplot(log_brca[, 1:20],
+        col = colorRampPalette(c("#a1dab4", "#41b6c4", "#2c7fb8"))(20),
+        border = "gray30",
+        las = 2,
+        cex.axis = 0.7,
+        names = substr(colnames(log_brca)[1:20], 1, 12),
+        main = "Expression per Sample (log2 RPKM)",
+        ylab = "log2(RPKM + 1)",
+        outline = TRUE,
+        outcol = "gray50",
+        outpch = 21,
+        outbg = "gray80",
+        outcex = 0.6,
+        boxwex = 0.6,
+        whisklty = 1,
+        staplewex = 0.3)
+
+grid(nx = NA, ny = NULL, col = "gray90", lty = "dotted")
+box()
+
+hist(log_brca, breaks = 50, col = "steelblue",
+     main = "Histogram of log2(RPKM + 1)",
+     xlab = "log2(RPKM + 1)")
+
+gene_var <- apply(log_brca, 1, var)
+top_genes <- names(sort(gene_var, decreasing = TRUE))[1:50]
+heatmap(log_brca[top_genes, 1:20])
+```
+
+Step 7: PCA
+```{r}
+pca_data_full <- t(log_brca)
+pca_result_full <- prcomp(pca_data_full, scale. = TRUE)
+
+var_explained_full <- (pca_result_full$sdev^2) / sum(pca_result_full$sdev^2) * 100
+
+barplot(var_explained_full[1:10],
+        names.arg = paste0("PC", 1:10),
+        col = colorRampPalette(c("#2c7fb8", "#41b6c4", "#a1dab4"))(10),
+        main = "Scree Plot: % Variance Explained (All Genes)",
+        ylab = "Percentage of Variance Explained (%)",
+        xlab = "Principal Component",
+        border = "white", las = 1)
+text(x = seq(0.7, by = 1.2, length.out = 10),
+     y = var_explained_full[1:10] + 0.5,
+     labels = paste0(round(var_explained_full[1:10], 1), "%"),
+     cex = 0.8)
+
+sample_type <- substr(colnames(brca), 14, 15)
+group <- ifelse(sample_type == "01", "Tumor", "Normal")
+group_colors <- ifelse(group == "Tumor", "#e34a33", "#2c7fb8")
+
+plot(pca_result_full$x[,1], pca_result_full$x[,2],
+     col = group_colors, pch = 19, cex = 1.2,
+     xlab = paste0("PC1 (", round(var_explained_full[1], 1), "% variance)"),
+     ylab = paste0("PC2 (", round(var_explained_full[2], 1), "% variance)"),
+     main = "PCA Plot: Tumor vs Normal Samples (All Genes)",
+     bty = "l")
+grid(col = "gray90")
+abline(h = 0, v = 0, col = "gray70", lty = 2)
+legend("topright", legend = c("Tumor", "Normal"),
+       col = c("#e34a33", "#2c7fb8"), pch = 19, bty = "n")
+```
+
+Step 8: Load additional libraries
+```{r}
+library(cluster)
+library(caret)
+library(randomForest)
+library(e1071)
+library(class)
+library(pROC)
+library(glmnet)
+```
+
+Step 9: K-means clustering
+```{r}
+var_explained_full <- (pca_result_full$sdev^2) / sum(pca_result_full$sdev^2) * 100
+cum_var <- cumsum(var_explained_full)
+n_pcs <- which(cum_var >= 80)[1]
+cat("Using", n_pcs, "PCs, explaining", round(cum_var[n_pcs], 1), "% of variance\n")
+
+km_data_sc <- pca_result_full$x[, 1:n_pcs]
+
+set.seed(123)
+wss <- sapply(1:8, function(k) kmeans(km_data_sc, centers = k, nstart = 10)$tot.withinss)
+plot(1:8, wss, type = "b", pch = 19,
+     xlab = "Number of clusters (k)", ylab = "Total within-cluster SS",
+     main = "Elbow Method for Choosing k")
+
+set.seed(123)
+km_res <- kmeans(km_data_sc, centers = 2, nstart = 25)
+
+table(Cluster = km_res$cluster, TrueLabel = group)
+
+plot(km_data_sc[, 1], km_data_sc[, 2],
+     col = c("#2c7fb8", "#e34a33")[km_res$cluster],
+     pch = 19, xlab = "PC1", ylab = "PC2",
+     main = paste0("K-means Clustering (k = 2) on Top ", n_pcs, " PCs"))
+legend("topright", legend = paste("Cluster", sort(unique(km_res$cluster))),
+       col = c("#2c7fb8", "#e34a33"), pch = 19, bty = "n")
+```
+
+Step 10: Hierarchical clustering
+```{r}
+d <- dist(km_data_sc, method = "euclidean")
+hc <- hclust(d, method = "ward.D2")
+
+plot(hc, labels = FALSE, main = "Hierarchical Clustering Dendrogram",
+     xlab = "Samples", sub = "")
+hc_clusters <- cutree(hc, k = 2)
+rect.hclust(hc, k = 2, border = c("#2c7fb8", "#e34a33"))
+
+table(Cluster = hc_clusters, TrueLabel = group)
+```
+
+Step 11: Silhouette score
+```{r}
+sil <- silhouette(km_res$cluster, d)
+plot(sil, col = c("#2c7fb8", "#e34a33"), main = "Silhouette Plot (K-means, k = 2)")
+cat("Average silhouette width (k-means):", mean(sil[, 3]), "\n")
+```
+
+Step 12: Consensus clustering - feature selection
+```{r}
+gene_var_cc <- apply(log_brca, 1, var)
+top_var_cc  <- names(sort(gene_var_cc, decreasing = TRUE))[1:1000]
+
+cc_data    <- t(log_brca[top_var_cc, ])
+cc_data_sc <- scale(cc_data)
+cc_data_sc <- cc_data_sc[, colSums(is.na(cc_data_sc)) == 0]
+dim(cc_data_sc)
+```
+
+Step 13: Consensus clustering - k-means base
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!requireNamespace("ConsensusClusterPlus", quietly = TRUE)) {
+  BiocManager::install("ConsensusClusterPlus", update = FALSE, ask = FALSE)
+}
+if (!requireNamespace("mclust", quietly = TRUE)) {
+  install.packages("mclust")
+}
+
+library(ConsensusClusterPlus)
+
+consensus_input <- t(cc_data_sc)
+
+results_cc <- ConsensusClusterPlus(
+  consensus_input,
+  maxK       = 6,
+  reps       = 100,
+  pItem      = 0.8,
+  pFeature   = 1,
+  clusterAlg = "km",
+  distance   = "euclidean",
+  innerLinkage = "ward.D2",
+  finalLinkage  = "ward.D2",
+  seed       = 123,
+  plot       = NULL,
+  title      = "consensus_cluster_output"
+)
+```
+
+Step 14: Consensus clustering - hierarchical base
+```{r}
+results_cc_hc <- ConsensusClusterPlus(
+  consensus_input,
+  maxK       = 6,
+  reps       = 100,
+  pItem      = 0.8,
+  pFeature   = 1,
+  clusterAlg = "hc",
+  distance   = "euclidean",
+  innerLinkage = "ward.D2",
+  finalLinkage  = "ward.D2",
+  seed       = 123,
+  plot       = NULL,
+  title      = "consensus_cluster_output_hc"
+)
+```
+
+Step 15: Choosing k (PAC)
+```{r}
+calc_pac <- function(consensus_matrix, lower = 0.1, upper = 0.9) {
+  vals <- consensus_matrix[upper.tri(consensus_matrix)]
+  mean(vals > lower & vals < upper)
+}
+
+pac_vals <- sapply(2:6, function(k) calc_pac(results_cc[[k]]$consensusMatrix))
+names(pac_vals) <- paste0("k=", 2:6)
+pac_vals
+
+best_k <- as.integer(sub("k=", "", names(which.min(pac_vals))))
+cat("Selected k (lowest PAC):", best_k, "\n")
+
+plot(2:6, pac_vals, type = "b", pch = 19, xlab = "k",
+     ylab = "Proportion of Ambiguous Clustering (PAC)",
+     main = "PAC by Number of Clusters")
+abline(v = best_k, col = "red", lty = 2)
+```
+
+Step 16: Final consensus clusters and agreement with true labels
+```{r}
+consensus_clusters <- results_cc[[best_k]]$consensusClass
+names(consensus_clusters) <- colnames(consensus_input)
+
+table(ConsensusCluster = consensus_clusters, TrueLabel = group)
+
+mean_within_between <- function(consensus_matrix, clusters) {
+  n <- length(clusters)
+  within_vals <- c(); between_vals <- c()
+  for (i in 1:(n - 1)) for (j in (i + 1):n) {
+    v <- consensus_matrix[i, j]
+    if (clusters[i] == clusters[j]) within_vals <- c(within_vals, v)
+    else between_vals <- c(between_vals, v)
+  }
+  c(mean_within = mean(within_vals), mean_between = mean(between_vals))
+}
+mean_within_between(results_cc[[best_k]]$consensusMatrix, consensus_clusters)
+```
+
+Step 17: Consensus clustering - ARI
+```{r}
+library(mclust)
+
+ari_vs_truth <- adjustedRandIndex(consensus_clusters, group)
+ari_km_vs_hc <- adjustedRandIndex(
+  results_cc[[best_k]]$consensusClass,
+  results_cc_hc[[best_k]]$consensusClass
+)
+
+cat("ARI: consensus clusters vs true Tumor/Normal labels:", round(ari_vs_truth, 4), "\n")
+cat("ARI: k-means-based vs hierarchical-based consensus solution:", round(ari_km_vs_hc, 4), "\n")
+```
+
+Step 18: Feature selection for classification
+```{r}
+group_factor <- factor(group, levels = c("Normal", "Tumor"))
+
+t_stats <- apply(log_brca, 1, function(x) {
+  tt <- try(t.test(x ~ group_factor), silent = TRUE)
+  if (inherits(tt, "try-error")) return(0)
+  tt$statistic
+})
+top_features <- names(sort(abs(t_stats), decreasing = TRUE))[1:100]
+
+model_data <- as.data.frame(t(log_brca[top_features, ]))
+model_data$Class <- group_factor
+
+colnames(model_data) <- make.names(colnames(model_data), unique = TRUE)
+
+dim(model_data)
+table(model_data$Class)
+```
+
+Step 19: Train/test split
+```{r}
+set.seed(42)
+train_idx  <- createDataPartition(model_data$Class, p = 0.7, list = FALSE)
+train_data <- model_data[train_idx, ]
+test_data  <- model_data[-train_idx, ]
+
+dim(train_data); dim(test_data)
+table(train_data$Class)
+table(test_data$Class)
+```
+
+Step 20: Train Random Forest
+```{r}
+train_x_rf <- train_data[, setdiff(names(train_data), "Class")]
+train_y_rf <- train_data$Class
+
+set.seed(42)
+rf_model <- randomForest(x = train_x_rf, y = train_y_rf, ntree = 500,
+                          importance = TRUE)
+print(rf_model)
+
+varImpPlot(rf_model, n.var = 15, main = "Top 15 Genes by Importance (RF)")
+```
+
+Step 21: Train SVM
+```{r}
+set.seed(42)
+svm_model <- svm(Class ~ ., data = train_data, kernel = "radial",
+                  probability = TRUE)
+summary(svm_model)
+```
+
+Step 22: Train kNN
+```{r}
+train_x <- train_data[, setdiff(names(train_data), "Class")]
+test_x  <- test_data[,  setdiff(names(test_data),  "Class")]
+
+set.seed(42)
+knn_pred <- knn(train = train_x, test = test_x,
+                 cl = train_data$Class, k = 5, prob = TRUE)
+```
+
+Step 23: Train Elastic Net Logistic Regression
+```{r}
+x_train <- as.matrix(train_data[, setdiff(names(train_data), "Class")])
+y_train <- train_data$Class
+x_test  <- as.matrix(test_data[,  setdiff(names(test_data),  "Class")])
+
+set.seed(42)
+cv_fit <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 0.5)
+plot(cv_fit)
+```
+
+Step 24: Predictions on test set
+```{r}
+rf_pred   <- predict(rf_model, newdata = test_data)
+svm_pred  <- predict(svm_model, newdata = test_data)
+glm_prob  <- predict(cv_fit, newx = x_test, s = "lambda.min", type = "response")
+glm_pred  <- factor(ifelse(glm_prob > 0.5, "Tumor", "Normal"),
+                     levels = levels(test_data$Class))
+```
+
+Step 25: Confusion matrices
+```{r}
+cm_rf   <- confusionMatrix(rf_pred,  test_data$Class, positive = "Tumor")
+cm_svm  <- confusionMatrix(svm_pred, test_data$Class, positive = "Tumor")
+cm_knn  <- confusionMatrix(knn_pred, test_data$Class, positive = "Tumor")
+cm_glm  <- confusionMatrix(glm_pred, test_data$Class, positive = "Tumor")
+
+cm_rf
+cm_svm
+cm_knn
+cm_glm
+```
+
+Step 26: Accuracy comparison table
+```{r}
+extract_metrics <- function(cm, model_name) {
+  data.frame(
+    Model       = model_name,
+    Accuracy    = round(cm$overall["Accuracy"], 4),
+    Kappa       = round(cm$overall["Kappa"], 4),
+    Sensitivity = round(cm$byClass["Sensitivity"], 4),
+    Specificity = round(cm$byClass["Specificity"], 4),
+    Precision   = round(cm$byClass["Precision"], 4),
+    F1          = round(cm$byClass["F1"], 4)
+  )
+}
+
+results <- rbind(
+  extract_metrics(cm_rf,  "Random Forest"),
+  extract_metrics(cm_svm, "SVM (RBF)"),
+  extract_metrics(cm_knn, "kNN (k=5)"),
+  extract_metrics(cm_glm, "Elastic Net Logistic")
+)
+rownames(results) <- NULL
+results
+```
+
+Step 27: Accuracy comparison plot
+```{r}
+barplot(results$Accuracy, names.arg = results$Model,
+        col = c("#2c7fb8", "#41b6c4", "#a1dab4", "#e34a33"),
+        ylim = c(0, 1), las = 2, ylab = "Test-set Accuracy",
+        main = "Model Accuracy Comparison")
+abline(h = seq(0, 1, 0.2), col = "gray90", lty = "dotted")
+box()
+```
+
+Step 28: ROC curves and AUC
+```{r}
+rf_prob  <- predict(rf_model, newdata = test_data, type = "prob")[, "Tumor"]
+svm_score <- attr(predict(svm_model, newdata = test_data, probability = TRUE),
+                   "probabilities")[, "Tumor"]
+knn_score <- ifelse(knn_pred == "Tumor",
+                     attr(knn_pred, "prob"), 1 - attr(knn_pred, "prob"))
+
+roc_rf  <- roc(test_data$Class, rf_prob,  levels = c("Normal", "Tumor"))
+roc_svm <- roc(test_data$Class, svm_score, levels = c("Normal", "Tumor"))
+roc_knn <- roc(test_data$Class, knn_score, levels = c("Normal", "Tumor"))
+roc_glm <- roc(test_data$Class, as.numeric(glm_prob), levels = c("Normal", "Tumor"))
+
+plot(roc_rf,  col = "#2c7fb8", lwd = 2, main = "ROC Curves: Model Comparison")
+lines(roc_svm, col = "#41b6c4", lwd = 2)
+lines(roc_knn, col = "#a1dab4", lwd = 2)
+lines(roc_glm, col = "#e34a33", lwd = 2)
+legend("bottomright",
+       legend = c(paste0("RF (AUC=",  round(auc(roc_rf), 3), ")"),
+                  paste0("SVM (AUC=", round(auc(roc_svm), 3), ")"),
+                  paste0("kNN (AUC=", round(auc(roc_knn), 3), ")"),
+                  paste0("GLMNET (AUC=", round(auc(roc_glm), 3), ")")),
+       col = c("#2c7fb8", "#41b6c4", "#a1dab4", "#e34a33"), lwd = 2, bty = "n")
+```
+
+Step 29: 5-fold cross-validation (Random Forest)
+```{r}
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE,
+                      summaryFunction = twoClassSummary, savePredictions = TRUE)
+
+set.seed(42)
+rf_cv <- train(Class ~ ., data = train_data, method = "rf",
+                trControl = ctrl, metric = "ROC",
+                tuneGrid = expand.grid(mtry = c(2, 5, 10, 15)))
+
+rf_cv
+plot(rf_cv, main = "5-fold CV: Accuracy (ROC) vs mtry")
+```
+
+Step 30: Summary
+```{r}
+cat("Clustering agreement (k-means vs true labels):\n")
+print(table(km_res$cluster, group))
+
+cat("\nBest performing model by test-set accuracy:\n")
+print(results[which.max(results$Accuracy), ])
+
+cat("\nBest cross-validated mtry for Random Forest:", rf_cv$bestTune$mtry, "\n")
+```
